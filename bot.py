@@ -5,7 +5,7 @@
 Steam Farming Bot — финальная версия для Render (Background Worker)
 Реальная накрутка часов через браузер (Playwright)
 Автор: Assistant
-Версия: 6.0 (без Flask, для Background Worker)
+Версия: 7.0 (исправлен конфликт и обновлён вход)
 """
 
 import asyncio
@@ -281,7 +281,7 @@ class SteamPlaywrightFarming:
                 )
                 self.context = await self.browser.new_context(
                     viewport={'width': 1280, 'height': 720},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 )
                 self.page = await self.context.new_page()
 
@@ -568,6 +568,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используй кнопки меню.")
 
 async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
+    """Улучшенная функция входа с надёжными селекторами и отладкой"""
     account_id = farm_data['account_id']
     account_name = farm_data['account_name']
     game_id = farm_data['game_id']
@@ -576,40 +577,108 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
+            browser = await p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
             page = await context.new_page()
 
+            # Переходим на страницу логина
             await page.goto('https://store.steampowered.com/login/')
-            await page.fill('#input_username', account_name)
-            await page.fill('#input_password', password)
-            if twofa:
-                await page.fill('#twofactorcode_entry', twofa)
-            await page.click('#login_btn_signin')
-            try:
-                await page.wait_for_selector('.user_avatar', timeout=60000)
-            except:
-                await update.message.reply_text("❌ Ошибка входа. Проверь пароль/код.")
-                await browser.close()
-                return
+            await page.wait_for_load_state('networkidle')
 
+            # Делаем скриншот для отладки (сохраняется в контейнере, можно посмотреть через Render Shell)
+            await page.screenshot(path='login_page.png')
+            logger.info("Скриншот страницы логина сохранён как login_page.png")
+
+            # Пытаемся найти поле логина разными селекторами
+            username_selectors = [
+                '#input_username',
+                'input[type="text"][name="username"]',
+                'input[type="email"]',
+                'input[autocomplete="username"]',
+                'input:below(:text("Sign in"))'
+            ]
+            username_input = None
+            for sel in username_selectors:
+                try:
+                    username_input = await page.wait_for_selector(sel, timeout=3000)
+                    if username_input:
+                        logger.info(f"Поле логина найдено по селектору: {sel}")
+                        break
+                except:
+                    continue
+
+            if not username_input:
+                # Если не нашли, пробуем более сложный подход: ищем любой input, который не password
+                inputs = await page.query_selector_all('input:not([type="password"])')
+                for inp in inputs:
+                    placeholder = await inp.get_attribute('placeholder') or ''
+                    if 'login' in placeholder.lower() or 'account' in placeholder.lower() or 'steam' in placeholder.lower():
+                        username_input = inp
+                        logger.info("Поле логина найдено по плейсхолдеру")
+                        break
+
+            if not username_input:
+                await page.screenshot(path='login_error.png')
+                raise Exception("Не найдено поле ввода логина. Проверьте скриншот login_error.png")
+
+            await username_input.fill(account_name)
+
+            # Поле пароля обычно проще
+            password_input = await page.wait_for_selector('input[type="password"]', timeout=5000)
+            await password_input.fill(password)
+
+            # Кнопка входа
+            login_button = await page.wait_for_selector('button[type="submit"]', timeout=5000)
+            await login_button.click()
+
+            # Ожидаем либо появления аватарки (успешный вход), либо поля для 2FA
+            try:
+                # Если двухфакторка включена, может появиться поле для кода
+                twofa_input = await page.wait_for_selector('#twofactorcode_entry, input[name="twofactorcode"]', timeout=5000)
+                if twofa and twofa_input:
+                    await twofa_input.fill(twofa)
+                    await login_button.click()
+                elif twofa and not twofa_input:
+                    logger.warning("Код 2FA предоставлен, но поле не появилось. Возможно, вход уже выполнен.")
+            except:
+                # Если поле для 2FA не появилось, значит, возможно, вход уже выполнен
+                pass
+
+            # Ждём успешного входа (появление аватарки или перенаправление на главную)
+            try:
+                await page.wait_for_selector('.user_avatar', timeout=30000)
+                logger.info("Успешный вход в Steam")
+            except:
+                # Проверим, не на главной ли мы
+                if 'store.steampowered.com' in page.url and 'login' not in page.url:
+                    logger.info("Похоже, вход выполнен (редирект на главную)")
+                else:
+                    await page.screenshot(path='login_failed.png')
+                    raise Exception("Вход не удался. Проверьте скриншот login_failed.png")
+
+            # Сохраняем куки
             cookies = await context.cookies()
             with open(cookies_file, 'w') as f:
                 json.dump(cookies, f)
 
-            steam_id = await page.evaluate('() => g_steamID || "unknown"')
+            # Обновляем steam_id (можно получить со страницы)
+            steam_id = await page.evaluate('() => window.g_steamID || "unknown"')
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute('UPDATE steam_accounts SET steam_id = ? WHERE id = ?', (steam_id, account_id))
             conn.commit()
             conn.close()
 
+            # Переходим на страницу игры
             await page.goto(f'https://store.steampowered.com/app/{game_id}/')
             play_button = await page.query_selector('a.btn_playit')
             if play_button:
                 await play_button.click()
                 await asyncio.sleep(5)
 
+            # Создаём объект фарминга
             farming = SteamPlaywrightFarming(
                 user_id=user_id,
                 account_id=account_id,
@@ -649,6 +718,7 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
             await update.message.reply_text(f"✅ Фарминг запущен для {game_name} с аккаунтом {account_name}!")
 
     except Exception as e:
+        logger.exception("Ошибка в perform_login_and_farm")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def start_farming_session(query, user_id, farm_data, cookies_file):
@@ -709,6 +779,7 @@ async def start_farming_session(query, user_id, farm_data, cookies_file):
             await query.edit_message_text(f"✅ Фарминг запущен для {game_name} с аккаунтом {account_name}!")
 
     except Exception as e:
+        logger.exception("Ошибка в start_farming_session")
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
 async def stop_farming(user_id):
@@ -762,6 +833,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 # ==================== ЗАПУСК ====================
+async def delete_webhook(app):
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Вебхук удалён, конфликты сброшены")
+
 def main():
     # Проверяем, что токен задан
     if not BOT_TOKEN:
@@ -777,6 +852,11 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Удаляем вебхук перед запуском polling (чтобы избежать конфликтов)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(delete_webhook(app))
 
     logger.info("Telegram-бот запущен...")
     app.run_polling()
