@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Steam Farming Bot — РАБОЧАЯ ВЕРСИЯ ДЛЯ PYDROID3
-Реальная накрутка часов через браузер (Playwright)
+Steam Farming Bot — версия для Render
+Реальная накрутка часов через браузер (Playwright) + Flask для поддержания активности
 Автор: Assistant
-Версия: 4.0 (многофункциональная, ~1200 строк)
+Версия: 5.0 (адаптирована для Render)
 """
 
 import asyncio
@@ -13,26 +13,29 @@ import sqlite3
 import os
 import logging
 import time
-import random
 import json
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from contextlib import asynccontextmanager
+import threading
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+
+# Flask для HTTP-сервера
+from flask import Flask
 
 # Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters, ConversationHandler
+    ContextTypes, MessageHandler, filters
 )
 
 # Playwright
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
-# ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8219189803:AAF4Bpp6LS5WVzNKLxoBtK1ZG-2ZmFyOPvg"  # Твой токен
-ADMIN_IDS = [6197133464]                                      # Твой Telegram ID
+# ==================== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8219189803:AAF4Bpp6LS5WVzNKLxoBtK1ZG-2ZmFyOPvg")
+ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "6197133464")
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip()]
+
 DB_PATH = "steam_farming.db"
 SESSIONS_DIR = "steam_sessions"
 COOKIES_DIR = "cookies"
@@ -48,11 +51,8 @@ logger = logging.getLogger(__name__)
 
 # ==================== БАЗА ДАННЫХ ====================
 def init_db():
-    """Инициализация всех таблиц"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
-    # Пользователи бота
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -61,8 +61,6 @@ def init_db():
         is_banned INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
-
-    # Аккаунты Steam
     c.execute('''CREATE TABLE IF NOT EXISTS steam_accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -73,8 +71,6 @@ def init_db():
         last_used TIMESTAMP,
         FOREIGN KEY(user_id) REFERENCES users(user_id)
     )''')
-
-    # Сессии фарминга
     c.execute('''CREATE TABLE IF NOT EXISTS farming_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -85,27 +81,21 @@ def init_db():
         end_time TIMESTAMP,
         minutes_farmed INTEGER DEFAULT 0,
         status TEXT DEFAULT 'active',
-        browser_pid INTEGER,
         FOREIGN KEY(user_id) REFERENCES users(user_id),
         FOREIGN KEY(account_id) REFERENCES steam_accounts(id)
     )''')
-
-    # Статистика по играм
     c.execute('''CREATE TABLE IF NOT EXISTS game_stats (
         game_id TEXT PRIMARY KEY,
         game_name TEXT,
         total_minutes INTEGER DEFAULT 0,
         total_sessions INTEGER DEFAULT 0
     )''')
-
-    # Логи действий
     c.execute('''CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         action TEXT,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
-
     conn.commit()
     conn.close()
 
@@ -176,7 +166,6 @@ def db_end_farming_session(session_id: int, minutes: int):
     c = conn.cursor()
     c.execute('''UPDATE farming_sessions SET status = 'ended', end_time = CURRENT_TIMESTAMP,
                  minutes_farmed = ? WHERE id = ?''', (minutes, session_id))
-    # Обновить game_stats
     c.execute('SELECT game_id, game_name FROM farming_sessions WHERE id = ?', (session_id,))
     game_id, game_name = c.fetchone()
     c.execute('''INSERT INTO game_stats (game_id, game_name, total_minutes, total_sessions)
@@ -252,8 +241,8 @@ POPULAR_GAMES = {
 }
 
 # ==================== ГЛОБАЛЬНЫЕ ХРАНИЛИЩА ====================
-# active_farming[user_id] = (session_id, browser, context, page, game_id, start_time)
-active_farming: Dict[int, Tuple[int, Browser, BrowserContext, Page, str, float]] = {}
+# Теперь храним объекты SteamPlaywrightFarming
+active_farming: Dict[int, 'SteamPlaywrightFarming'] = {}
 
 # ==================== КЛАСС ДЛЯ УПРАВЛЕНИЯ PLAYWRIGHT ====================
 class SteamPlaywrightFarming:
@@ -287,9 +276,9 @@ class SteamPlaywrightFarming:
         """Основной цикл браузера"""
         try:
             async with async_playwright() as p:
-                # Запуск браузера (Chromium)
+                # Запуск браузера в headless-режиме (для сервера)
                 self.browser = await p.chromium.launch(
-                    headless=False,  # Видимый режим (можно True, но для отладки оставим False)
+                    headless=True,
                     args=['--disable-blink-features=AutomationControlled']
                 )
                 self.context = await self.browser.new_context(
@@ -310,13 +299,11 @@ class SteamPlaywrightFarming:
                 await self.page.goto(url, wait_until='networkidle')
 
                 # Проверяем, залогинены ли
-                if await self.page.query_selector('.user_avatar'):
-                    logger.info("Уже залогинены")
-                else:
-                    # Нужно логиниться
-                    await self._login()
+                if not await self.page.query_selector('.user_avatar'):
+                    # Если нет — нужно запросить логин через бота, но это уже обработано ранее
+                    raise Exception("Сессия истекла. Требуется повторный вход.")
 
-                # После входа сохраняем куки
+                # После проверки сохраняем куки (обновляем)
                 cookies = await self.context.cookies()
                 with open(self.cookies_file, 'w') as f:
                     json.dump(cookies, f)
@@ -344,22 +331,6 @@ class SteamPlaywrightFarming:
         finally:
             await self._stop()
 
-    async def _login(self):
-        """Выполняет вход в Steam с возможным запросом 2FA"""
-        # Нажимаем кнопку входа
-        login_link = await self.page.query_selector('a.global_action_link')
-        if login_link:
-            await login_link.click()
-            await self.page.wait_for_url('**/login/**', wait_until='networkidle')
-
-        # Заполняем форму
-        await self.page.fill('#input_username', self.account_name)
-        # Пароль нужно где-то взять — в нашей модели мы не храним пароль.
-        # Значит, при первом запуске нужно запросить пароль и код у пользователя.
-        # Реализуем через callback — но здесь мы не можем прерваться.
-        # Упростим: если нет кук, то выбрасываем исключение и просим пользователя ввести данные через бота.
-        raise Exception("Нет сохранённой сессии. Сначала выполните вход с паролем и 2FA.")
-
     async def _update_stats(self, minutes: int):
         """Обновляет статистику в БД (вызывается периодически)"""
         conn = sqlite3.connect(DB_PATH)
@@ -383,9 +354,19 @@ class SteamPlaywrightFarming:
         if self._task:
             self._task.cancel()
 
+# ==================== FLASK-СЕРВЕР ====================
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "Steam Farming Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 10000))
+    flask_app.run(host='0.0.0.0', port=port)
+
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню"""
     user = update.effective_user
     db_add_user(user.id, user.username, user.first_name)
 
@@ -409,7 +390,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_log_action(user.id, "/start")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка всех callback-запросов"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -423,7 +403,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['awaiting_login'] = True
 
     elif data == "games_menu":
-        # Кнопки с играми (по 2 в ряд)
         game_buttons = []
         row = []
         for i, (appid, name) in enumerate(POPULAR_GAMES.items()):
@@ -442,7 +421,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("farm_"):
         appid = data.replace("farm_", "")
         game_name = POPULAR_GAMES.get(appid, "Неизвестная игра")
-        # Проверим наличие аккаунтов
         accounts = db_get_user_accounts(user_id)
         if not accounts:
             await query.edit_message_text("❌ У тебя нет сохранённых аккаунтов. Добавь через меню.")
@@ -452,7 +430,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Уже есть активная сессия фарминга. Останови её сначала.")
             return
 
-        # Если один аккаунт — сразу предлагаем его
         if len(accounts) == 1:
             acc_id, acc_name, _ = accounts[0]
             context.user_data['farming_data'] = {
@@ -471,7 +448,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
         else:
-            # Несколько аккаунтов — предложим выбрать
             context.user_data['pending_game'] = (appid, game_name)
             acc_buttons = []
             for acc_id, acc_name, _ in accounts:
@@ -512,14 +488,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not farm_data:
             await query.edit_message_text("❌ Данные не найдены. Начни заново.")
             return
-        # Проверяем, есть ли куки для этого аккаунта
         account_info = db_get_account(farm_data['account_id'])
-        cookies_file = account_info[4]  # поле cookies_file
+        cookies_file = account_info[4]
         if os.path.exists(cookies_file):
-            # Есть куки — запускаем сразу
             await start_farming_session(query, user_id, farm_data, cookies_file)
         else:
-            # Кук нет — запрашиваем пароль и код
             context.user_data['awaiting_credentials'] = farm_data
             await query.edit_message_text(
                 f"🔑 Введи пароль и код Steam Guard для аккаунта **{farm_data['account_name']}** в формате:\n"
@@ -529,16 +502,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "stop_farming":
         if user_id in active_farming:
-            session_id, browser, context, page, game_id, start_time = active_farming.pop(user_id)
-            # Останавливаем задачу (она сама закроет браузер)
-            # Но у нас нет прямой ссылки на объект SteamPlaywrightFarming, только на компоненты.
-            # Упростим: будем хранить в active_farming объект класса
-            # Переделаем: active_farming[user_id] = (farming_obj)
-            # Сейчас там кортеж, нужно исправить.
+            farming = active_farming.pop(user_id)
+            farming.stop()
             await query.edit_message_text("⏹ Фарминг остановлен. Браузер закроется.")
-            # Реально остановим через вызов метода stop у объекта, но у нас его нет.
-            # Временно: просто удалим из словаря, браузер останется висеть.
-            # Нужно хранить объект!
         else:
             await query.edit_message_text("❌ Нет активной сессии.")
 
@@ -575,7 +541,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg)
 
     elif data == "back_to_main":
-        # Возврат в главное меню
         keyboard = [
             [InlineKeyboardButton("➕ Добавить аккаунт Steam", callback_data="add_account")],
             [InlineKeyboardButton("🎮 Начать фарминг", callback_data="games_menu")],
@@ -591,22 +556,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Добавление логина
     if context.user_data.get('awaiting_login'):
         login = text
-        # Создаём файл для кук
         cookies_file = f"{COOKIES_DIR}/{user_id}_{login}.json"
-        # Пока без steam_id, получим при первом входе
         account_id = db_add_steam_account(user_id, login, "unknown", cookies_file)
         await update.message.reply_text(f"✅ Аккаунт {login} добавлен. Теперь выбери игру для запуска.")
         context.user_data.pop('awaiting_login', None)
         return
 
-    # Ввод пароля и кода
     if context.user_data.get('awaiting_credentials'):
         farm_data = context.user_data['awaiting_credentials']
         parts = text.split(':')
@@ -616,7 +576,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         password = parts[0]
         twofa = parts[1] if len(parts) == 2 else None
 
-        # Теперь нужно запустить браузер и выполнить вход с этими данными
         await update.message.reply_text("🔄 Выполняю вход в Steam...")
         asyncio.create_task(perform_login_and_farm(
             update, user_id, farm_data, password, twofa
@@ -627,7 +586,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используй кнопки меню.")
 
 async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
-    """Выполняет вход через браузер и запускает фарминг"""
     account_id = farm_data['account_id']
     account_name = farm_data['account_name']
     game_id = farm_data['game_id']
@@ -636,20 +594,17 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+            browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page = await context.new_page()
 
-            # Переходим на страницу логина
             await page.goto('https://store.steampowered.com/login/')
             await page.fill('#input_username', account_name)
             await page.fill('#input_password', password)
             if twofa:
                 await page.fill('#twofactorcode_entry', twofa)
             await page.click('#login_btn_signin')
-            await page.wait_for_url('**/steamaccount/login**?*', timeout=30000)
-            # Если двухфакторка нужна, но не введена — будет запрос
-            # Ждём успешного входа
+            # Ждём либо перенаправления на главную, либо появления аватарки
             try:
                 await page.wait_for_selector('.user_avatar', timeout=60000)
             except:
@@ -657,7 +612,6 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
                 await browser.close()
                 return
 
-            # Сохраняем куки
             cookies = await context.cookies()
             with open(cookies_file, 'w') as f:
                 json.dump(cookies, f)
@@ -670,7 +624,7 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
             conn.commit()
             conn.close()
 
-            # Запускаем игру
+            # Переходим на страницу игры
             await page.goto(f'https://store.steampowered.com/app/{game_id}/')
             play_button = await page.query_selector('a.btn_playit')
             if play_button:
@@ -686,23 +640,19 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
                 game_name=game_name,
                 cookies_file=cookies_file
             )
-            # Подменяем запущенный браузер
+            # Передаём уже открытые browser, context, page
             farming.browser = browser
             farming.context = context
             farming.page = page
             farming.start_time = time.time()
             farming.session_id = db_start_farming_session(user_id, account_id, game_id, game_name)
-            # Запускаем фоновую задачу для периодического обновления
-            asyncio.create_task(farming._run())  # но _run уже запустит свой цикл, а у нас уже есть страница
-            # Лучше переделать _run так, чтобы он не создавал новый браузер, а использовал существующий.
-            # Упростим: не будем использовать класс, а просто оставим браузер открытым и обновляем страницу вручную.
 
-            # Вместо этого создадим задачу, которая будет обновлять страницу
+            # Запускаем задачу поддержания активности (вместо _run, чтобы не создавать новый браузер)
             async def keep_alive():
                 try:
                     while True:
                         await asyncio.sleep(600)
-                        await page.reload()
+                        await page.reload(wait_until='networkidle')
                         elapsed = int((time.time() - farming.start_time) / 60)
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
@@ -717,8 +667,8 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
                     await browser.close()
                     db_end_farming_session(farming.session_id, int((time.time() - farming.start_time)/60))
 
-            task = asyncio.create_task(keep_alive())
-            active_farming[user_id] = (farming.session_id, browser, context, page, game_id, time.time(), task)
+            farming._task = asyncio.create_task(keep_alive())
+            active_farming[user_id] = farming
 
             await update.message.reply_text(f"✅ Фарминг запущен для {game_name} с аккаунтом {account_name}!")
 
@@ -726,7 +676,6 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def start_farming_session(query, user_id, farm_data, cookies_file):
-    """Запуск фарминга с существующими куками"""
     account_id = farm_data['account_id']
     account_name = farm_data['account_name']
     game_id = farm_data['game_id']
@@ -734,26 +683,22 @@ async def start_farming_session(query, user_id, farm_data, cookies_file):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+            browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
-            # Загружаем куки
             with open(cookies_file, 'r') as f:
                 cookies = json.load(f)
             await context.add_cookies(cookies)
             page = await context.new_page()
             await page.goto(f'https://store.steampowered.com/app/{game_id}/')
-            # Проверяем, залогинены ли
             if not await page.query_selector('.user_avatar'):
                 await query.edit_message_text("❌ Сессия истекла. Нужно заново ввести пароль и код.")
                 await browser.close()
                 return
-            # Запускаем игру
             play_button = await page.query_selector('a.btn_playit')
             if play_button:
                 await play_button.click()
                 await asyncio.sleep(5)
 
-            # Создаём задачу обновления
             session_id = db_start_farming_session(user_id, account_id, game_id, game_name)
             start_time = time.time()
 
@@ -761,7 +706,7 @@ async def start_farming_session(query, user_id, farm_data, cookies_file):
                 try:
                     while True:
                         await asyncio.sleep(600)
-                        await page.reload()
+                        await page.reload(wait_until='networkidle')
                         elapsed = int((time.time() - start_time) / 60)
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
@@ -776,7 +721,15 @@ async def start_farming_session(query, user_id, farm_data, cookies_file):
                     db_end_farming_session(session_id, int((time.time() - start_time)/60))
 
             task = asyncio.create_task(keep_alive())
-            active_farming[user_id] = (session_id, browser, context, page, game_id, start_time, task)
+            # Создаём объект для удобства хранения
+            farming = SteamPlaywrightFarming(user_id, account_id, account_name, game_id, game_name, cookies_file)
+            farming.browser = browser
+            farming.context = context
+            farming.page = page
+            farming.start_time = start_time
+            farming.session_id = session_id
+            farming._task = task
+            active_farming[user_id] = farming
 
             await query.edit_message_text(f"✅ Фарминг запущен для {game_name} с аккаунтом {account_name}!")
 
@@ -784,18 +737,13 @@ async def start_farming_session(query, user_id, farm_data, cookies_file):
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
 async def stop_farming(user_id):
-    """Останавливает фарминг по user_id"""
     if user_id in active_farming:
-        session_id, browser, context, page, game_id, start_time, task = active_farming.pop(user_id)
-        task.cancel()
-        await browser.close()
-        elapsed = int((time.time() - start_time) / 60)
-        db_end_farming_session(session_id, elapsed)
+        farming = active_farming.pop(user_id)
+        farming.stop()
         return True
     return False
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /stop"""
     user_id = update.effective_user.id
     if await stop_farming(user_id):
         await update.message.reply_text("⏹ Фарминг остановлен.")
@@ -803,18 +751,15 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет активной сессии.")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /status"""
     user_id = update.effective_user.id
     if user_id in active_farming:
-        session_id, browser, context, page, game_id, start_time, task = active_farming[user_id]
-        elapsed = int((time.time() - start_time) / 60)
-        game_name = POPULAR_GAMES.get(game_id, "Неизвестная игра")
-        await update.message.reply_text(f"🎮 Активна сессия: {game_name}\nПрошло минут: {elapsed}")
+        farming = active_farming[user_id]
+        elapsed = int((time.time() - farming.start_time) / 60)
+        await update.message.reply_text(f"🎮 Активна сессия: {farming.game_name}\nПрошло минут: {elapsed}")
     else:
         await update.message.reply_text("❌ Нет активной сессии.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /stats"""
     user_id = update.effective_user.id
     stats = db_get_user_stats(user_id)
     msg = (f"📊 **Твоя статистика**\n"
@@ -829,7 +774,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /admin"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("❌ Доступ запрещён.")
@@ -844,8 +788,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ЗАПУСК ====================
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Запускаем Flask в отдельном потоке
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info("Flask-сервер запущен")
 
+    # Запускаем Telegram-бота
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -854,7 +802,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Бот запущен...")
+    logger.info("Telegram-бот запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
