@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Steam Farming Bot — версия для Render
-Реальная накрутка часов через браузер (Playwright) + Flask для поддержания активности
+Steam Farming Bot — финальная версия для Render (Background Worker)
+Реальная накрутка часов через браузер (Playwright)
 Автор: Assistant
-Версия: 5.0 (адаптирована для Render)
+Версия: 6.0 (без Flask, для Background Worker)
 """
 
 import asyncio
@@ -14,12 +14,8 @@ import os
 import logging
 import time
 import json
-import threading
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
-
-# Flask для HTTP-сервера
-from flask import Flask
 
 # Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,9 +28,12 @@ from telegram.ext import (
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
 # ==================== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8219189803:AAF4Bpp6LS5WVzNKLxoBtK1ZG-2ZmFyOPvg")
-ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "6197133464")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip()]
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в переменных окружения")
 
 DB_PATH = "steam_farming.db"
 SESSIONS_DIR = "steam_sessions"
@@ -166,6 +165,7 @@ def db_end_farming_session(session_id: int, minutes: int):
     c = conn.cursor()
     c.execute('''UPDATE farming_sessions SET status = 'ended', end_time = CURRENT_TIMESTAMP,
                  minutes_farmed = ? WHERE id = ?''', (minutes, session_id))
+    # Обновляем game_stats
     c.execute('SELECT game_id, game_name FROM farming_sessions WHERE id = ?', (session_id,))
     game_id, game_name = c.fetchone()
     c.execute('''INSERT INTO game_stats (game_id, game_name, total_minutes, total_sessions)
@@ -241,7 +241,6 @@ POPULAR_GAMES = {
 }
 
 # ==================== ГЛОБАЛЬНЫЕ ХРАНИЛИЩА ====================
-# Теперь храним объекты SteamPlaywrightFarming
 active_farming: Dict[int, 'SteamPlaywrightFarming'] = {}
 
 # ==================== КЛАСС ДЛЯ УПРАВЛЕНИЯ PLAYWRIGHT ====================
@@ -276,7 +275,6 @@ class SteamPlaywrightFarming:
         """Основной цикл браузера"""
         try:
             async with async_playwright() as p:
-                # Запуск браузера в headless-режиме (для сервера)
                 self.browser = await p.chromium.launch(
                     headless=True,
                     args=['--disable-blink-features=AutomationControlled']
@@ -300,10 +298,9 @@ class SteamPlaywrightFarming:
 
                 # Проверяем, залогинены ли
                 if not await self.page.query_selector('.user_avatar'):
-                    # Если нет — нужно запросить логин через бота, но это уже обработано ранее
                     raise Exception("Сессия истекла. Требуется повторный вход.")
 
-                # После проверки сохраняем куки (обновляем)
+                # Сохраняем куки (обновляем)
                 cookies = await self.context.cookies()
                 with open(self.cookies_file, 'w') as f:
                     json.dump(cookies, f)
@@ -317,9 +314,8 @@ class SteamPlaywrightFarming:
 
                 # Цикл поддержания активности (перезагрузка страницы каждые 10 минут)
                 while True:
-                    await asyncio.sleep(600)  # 10 минут
+                    await asyncio.sleep(600)
                     await self.page.reload(wait_until='networkidle')
-                    # Обновляем статистику
                     elapsed = int((time.time() - self.start_time) / 60)
                     await self._update_stats(elapsed)
                     logger.info(f"Сессия {self.session_id} обновлена, минут: {elapsed}")
@@ -332,7 +328,6 @@ class SteamPlaywrightFarming:
             await self._stop()
 
     async def _update_stats(self, minutes: int):
-        """Обновляет статистику в БД (вызывается периодически)"""
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('UPDATE farming_sessions SET minutes_farmed = ? WHERE id = ?',
@@ -341,7 +336,6 @@ class SteamPlaywrightFarming:
         conn.close()
 
     async def _stop(self):
-        """Остановка и закрытие браузера"""
         if self.browser:
             await self.browser.close()
         if self.session_id:
@@ -350,20 +344,8 @@ class SteamPlaywrightFarming:
         logger.info(f"Фарминг для user {self.user_id} остановлен")
 
     def stop(self):
-        """Остановка извне"""
         if self._task:
             self._task.cancel()
-
-# ==================== FLASK-СЕРВЕР ====================
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def home():
-    return "Steam Farming Bot is running!"
-
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    flask_app.run(host='0.0.0.0', port=port)
 
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -604,7 +586,6 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
             if twofa:
                 await page.fill('#twofactorcode_entry', twofa)
             await page.click('#login_btn_signin')
-            # Ждём либо перенаправления на главную, либо появления аватарки
             try:
                 await page.wait_for_selector('.user_avatar', timeout=60000)
             except:
@@ -616,7 +597,6 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
             with open(cookies_file, 'w') as f:
                 json.dump(cookies, f)
 
-            # Обновляем steam_id
             steam_id = await page.evaluate('() => g_steamID || "unknown"')
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
@@ -624,14 +604,12 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
             conn.commit()
             conn.close()
 
-            # Переходим на страницу игры
             await page.goto(f'https://store.steampowered.com/app/{game_id}/')
             play_button = await page.query_selector('a.btn_playit')
             if play_button:
                 await play_button.click()
                 await asyncio.sleep(5)
 
-            # Создаём объект фарминга
             farming = SteamPlaywrightFarming(
                 user_id=user_id,
                 account_id=account_id,
@@ -640,14 +618,12 @@ async def perform_login_and_farm(update, user_id, farm_data, password, twofa):
                 game_name=game_name,
                 cookies_file=cookies_file
             )
-            # Передаём уже открытые browser, context, page
             farming.browser = browser
             farming.context = context
             farming.page = page
             farming.start_time = time.time()
             farming.session_id = db_start_farming_session(user_id, account_id, game_id, game_name)
 
-            # Запускаем задачу поддержания активности (вместо _run, чтобы не создавать новый браузер)
             async def keep_alive():
                 try:
                     while True:
@@ -721,7 +697,6 @@ async def start_farming_session(query, user_id, farm_data, cookies_file):
                     db_end_farming_session(session_id, int((time.time() - start_time)/60))
 
             task = asyncio.create_task(keep_alive())
-            # Создаём объект для удобства хранения
             farming = SteamPlaywrightFarming(user_id, account_id, account_name, game_id, game_name, cookies_file)
             farming.browser = browser
             farming.context = context
@@ -788,9 +763,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ЗАПУСК ====================
 def main():
-    # Запускаем Flask в отдельном потоке
-    threading.Thread(target=run_flask, daemon=True).start()
-    logger.info("Flask-сервер запущен")
+    # Проверяем, что токен задан
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не задан! Установите переменную окружения.")
+        return
 
     # Запускаем Telegram-бота
     app = Application.builder().token(BOT_TOKEN).build()
